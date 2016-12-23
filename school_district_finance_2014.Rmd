@@ -1,0 +1,435 @@
+Public Elementary-Secondary Education Finance Data Analysis By Peter Tung
+========================================================
+This report analyzes the 2014 financial data for the public school system in the US for elementary and secondary schools.  More details of this raw data can be found in http://www.census.gov/govs/school/.  We will also take a quick peek at the relationships (if any) between this data and the top 50 school districts to see how much of role a school's finances play in a school's ranking.
+
+*Note: data for top 50 schools was manually created as there is a paywall for API access.  Hence, only 50 schools. (Source: https://k12.niche.com/rankings/public-school-districts/best-overall/)
+```{r echo=FALSE, message=FALSE, warning=FALSE, packages}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align='center') 
+
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(scales)
+library(choroplethr)
+library(choroplethrMaps)
+library(reshape2)
+suppressMessages(library(dplyr))
+library(ggmap)
+library(maps)
+```
+
+# Dataset
+```{r echo=TRUE, Load_the_Data}
+# Load the Data
+schoolFinanceFull <- read.csv("elsec14.csv", stringsAsFactors = FALSE, colClasses = c("SCHLEV"="character", "STATE"="character", "IDCENSUS" = "character"))
+
+top_50 <- read.csv("top_schools.csv", stringsAsFactors = FALSE)
+top_50$district <- toupper(top_50$district)
+schoolFinanceFull <- left_join(schoolFinanceFull, top_50, by=c("NAME"="district"))
+schoolFinanceFull$isTop50 <- !is.na(schoolFinanceFull$rank)
+
+#Data set cleanup
+schoolFinanceFull$STATE <- as.factor(schoolFinanceFull$STATE)
+schoolFinanceFull$SCHLEV <- as.factor(schoolFinanceFull$SCHLEV)
+schoolFinanceFull$CSA <- as.factor(schoolFinanceFull$CSA)
+schoolFinanceFull$CBSA <- as.factor(schoolFinanceFull$CBSA)
+
+levels(schoolFinanceFull$SCHLEV) <- c("ELE", "SEC", "ELE-SEC", "VOC-SP", "NOOP", "AGEN")
+names(schoolFinanceFull)[names(schoolFinanceFull) == 'V33'] <- 'NUMSTUDENTS'
+
+#We will change the state fips code to State abbreviation
+data("state.regions")
+schoolFinanceFull$STATE_FULL <- schoolFinanceFull$STATE
+levels(schoolFinanceFull$STATE) <- state.regions[order(state.regions$fips.numeric),]$abb
+levels(schoolFinanceFull$STATE_FULL) <- state.regions[order(state.regions$fips.numeric),]$region
+
+schoolFinanceFull$GOVTYPE <- as.factor(substr(schoolFinanceFull$IDCENSUS, 3,3))
+levels(schoolFinanceFull$GOVTYPE) <- c("STATE", "COUNTY", "CITY", "TOWNSHIP", "INDEPENDENT")
+```
+We display the code to load the data here to show that the dataset we curated was an amalgamation of multiple datasets.  Some data clean up was also required, as some values are coded as integers such as the school type (elementary, or secondary). Also the variable, IDCENSUS is an identification code for each dependent school system.  It is made up of various other codes such as county codes and state codes.  We already have the state and county information in other fields, so we extracted the "government type" information from this field and made it its own variable.
+
+```{r data_summary}
+dim(schoolFinanceFull)
+```
+Our final dataset consist of 14,397 observations, with 145 variables.  Most of these variables will not be used for this analysis, as it is simply a breakdown of other variables.  For example, school revenue (TOTALREV) is broken down to revenue from federal, state, and local sources (TFEDREV, TSTREV, and TLOCREV respectively).  These in turn are broken down further. The codebook (http://www2.census.gov/govs/school/school14doc.pdf) contains details of each of variables.
+
+# Univariate Analysis
+Let's start by looking at the distribution of revenue and expenditures of all school districts.
+```{r Univariate_Plots_1}
+ggplot(aes(x=TOTALREV), 
+       data=subset(schoolFinanceFull, TOTALREV < quantile(TOTALREV, 0.99) & TOTALREV > 0)) +
+  geom_histogram(bins = 100) + 
+  scale_x_log10(breaks = c(0,1000, 10000, 100000, 500000), labels = comma) +
+  xlab("Total Revenue ($1000's)") 
+
+ggplot(aes(x=TOTALEXP), 
+       data=subset(schoolFinanceFull, TOTALEXP < quantile(TOTALEXP, 0.99) & TOTALEXP > 0)) +
+  geom_histogram(bins = 100) + 
+  scale_x_log10(breaks = c(0,1000, 10000, 100000, 500000), labels = comma) +
+  xlab("Total Expenditure ($1000's)") 
+```
+
+The revenue and expenditure distribution looks very similar in terms of the distribution curve and well as values of the distribution. This suggests that there could be a relationship, but it is too early to conclude at this point.
+Note that we removed the top 1 percent in terms of revenue and expenditures in the plots above. We can see below that the max of both total revenue and expenditure was far from the 3rd quantile suggesting that there are a couple of outliers in our dataset.
+```{r rev_exp_summary}
+summary(schoolFinanceFull[c("TOTALREV", "TOTALEXP")])
+```
+
+Next, we look at the distribution of the number of students in each district.
+```{r Univariate_Plots_2}
+ggplot(aes(x=NUMSTUDENTS), 
+       data=subset(schoolFinanceFull, NUMSTUDENTS < quantile(NUMSTUDENTS, 0.99))) +
+  geom_histogram(binwidth = 1000)
+```
+
+It seems like most schools districts have under 1000 students.  However, a good group of these have zero student.
+```{r echo=TRUE, zero_students}
+nrow(schoolFinanceFull[schoolFinanceFull$NUMSTUDENTS==0,])
+```
+
+Upon further inspection, many of the zero student school districts are "Nonoperating School System", or "Educational Service Agency".  The rest could simply be incomplete data. We will keep this in mind in our analysis going forward.
+```{r echo=TRUE, zero_students_2}
+nrow(subset(schoolFinanceFull, NUMSTUDENTS==0 & SCHLEV %in% c("NOOP","AGEN")))
+```
+  
+Replotting the distribution on number of students, we get:
+```{r Univariate_Plots_3}
+ggplot(aes(x=NUMSTUDENTS), 
+       data=subset(schoolFinanceFull, NUMSTUDENTS < quantile(NUMSTUDENTS, 0.99) & NUMSTUDENTS > 0)) +
+  geom_histogram(bins = 50) +
+  scale_x_log10()
+```
+
+
+Finally, let's look the distribution of the different types of schools and the number of school districts within each state.
+```{r Univariate_Plots_4}
+ggplot(aes(x=SCHLEV), data=schoolFinanceFull) + geom_bar()
+
+ggplot(aes(x=GOVTYPE), data=schoolFinanceFull) + geom_bar()
+
+ggplot(aes(x=STATE), data=schoolFinanceFull) + geom_bar() + 
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+Surprisingly, most school districts and independent school systems and only a small number are state/country city/township dependent school systems. We also note that most school districts are a combination of elementary and secondary schools.
+
+There are other features such as county data, and revenue breakdown that we will use in our bivariate and multivariate analysis. 
+
+# Bivariate Analysis
+We'll start by looking at total revenue as compared to other parameters.
+```{r Bivariate_Plots_1}
+total_rev_by_state <- schoolFinanceFull %>%
+  filter(!is.element(SCHLEV, c("NOOP","AGEN"))) %>%
+  group_by(STATE_FULL) %>%
+  summarise(value = sum(TOTALREV)) %>%
+  arrange(STATE_FULL)
+colnames(total_rev_by_state) <- c("region", "value")
+choro = StateChoropleth$new(total_rev_by_state)
+choro$title = "2014 Total Revenue by State"
+choro$ggplot_scale = scale_fill_brewer(name="Revenue", drop=FALSE)
+choro$render()
+```
+
+Not surprisingly the states with the highest revenues are the states that are also the highest in population (http://www.enchantedlearning.com/usa/states/population.shtml). 
+```{r Bivariate_Plots_2}
+total_rev_by_county <- schoolFinanceFull %>%
+  filter(!is.element(SCHLEV, c("NOOP","AGEN"))) %>%
+  group_by(CONUM) %>%
+  summarise(value = sum(TOTALREV)) %>%
+  arrange(CONUM)
+colnames(total_rev_by_county) <- c("region", "value")
+choro = CountyChoropleth$new(total_rev_by_county)
+choro$title = "2014 Total Revenue by County"
+choro$ggplot_scale = scale_fill_brewer(name="Revenue", drop=FALSE)
+choro$render()
+```
+
+We can see that certain a small number counties make up most of the state's total revenue. It is also interesting to see that is a band that cuts down right in the center of the country where the counties have very little school revenue, which from the state level map suggest that it's an area of low population in the US, assuming that the revenue per student is even across the board.  We'll explore that idea later below.
+
+For now, let's take a quick look at the expenditures.
+```{r Bivariate_Plots_3}
+total_exp_by_county <- schoolFinanceFull %>%
+  filter(!is.element(SCHLEV, c("NOOP","AGEN"))) %>%
+  group_by(CONUM) %>%
+  summarise(value = sum(TOTALEXP)) %>%
+  arrange(CONUM)
+colnames(total_exp_by_county) <- c("region", "value")
+choro = CountyChoropleth$new(total_exp_by_county)
+choro$title = "2014 Total Expenditure by County"
+choro$ggplot_scale = scale_fill_brewer(name="Expenditure", palette="Reds", drop=FALSE)
+choro$render()
+```
+
+This looks very similar the the total revenue map...
+```{r Bivariate_Plots_4}
+ggplot(aes(x= TOTALREV, y=TOTALEXP), 
+       data=subset(schoolFinanceFull, TOTALEXP < quantile(TOTALEXP, 0.99))) + 
+  geom_point(alpha=1/20) +
+  geom_abline(intercept = 0, slope = 1, color = "blue")
+```
+
+A plot of revenue vs expenditure with the blue line being the break even point (revenue = expenditure) reveals that pretty much all schools spend everything they get in revenue, and in many cases the district spends more than they have. This relationship suggests that schools are run on a very tight budget and/or school districts are pressured to spend all of their fundings in order to maintain the same level of funding from year to year.  It would be interesting to follow the school districts over time to see how their funding levels change.
+
+Let's switch gears for now and look at some trends in the top 50 school districts.
+```{r Bivariate_Plots_5}
+state_map <- map_data("state")
+top50_by_state <- schoolFinanceFull %>%
+  group_by(STATE_FULL) %>%
+  summarise(value = sum(isTop50)) %>%
+  arrange(STATE_FULL)
+top50_by_state <- merge(state_map, top50_by_state, by.x=c("region"), 
+                        by.y=c("STATE_FULL"), all.x=TRUE)
+top50_by_state[is.na(top50_by_state)] <- 0
+top50_by_state <- arrange(top50_by_state, group, order)
+ggplot(top50_by_state, aes(x=long, y=lat, group=group, fill=factor(value))) +
+  geom_polygon(colour=NA, aes(fill=factor(value))) +
+  scale_fill_manual(values=c("grey","red","orange","yellow","green","blue","purple","black")) +
+  expand_limits(x = top50_by_state$long, y = top50_by_state$lat) +
+  coord_map("polyconic") + 
+  labs(fill="Number Per\nState")
+```
+
+We can see that the most of the top 50 school districts are clustered in the northeastern corner of the country (33!), with New York State having 14 of the top 50 districts.
+```{r Bivariate_Plots_6}
+county_map <- map_data("county")
+data("county.regions")
+
+#The county map was missing some data for specific counties, and it just so happens that
+#Dupage, IL was one of the counties that we needed for our points.  Lets fill in this data...
+#http://boundaries.us/il/dupage-county/
+dupage_county <- read.csv("dupage.csv", header = FALSE, col.names = c("lat", "long"))
+dupage_county$region <- "illinois"
+dupage_county$subregion <- "dupage"
+dupage_county$group <- max(county_map$group + 1)
+dupage_county$order <- seq(max(county_map$order)+1, max(county_map$order) + nrow(dupage_county), by=1)
+county_map <- rbind(county_map, dupage_county)
+
+top50_by_county <- schoolFinanceFull %>%
+  group_by(CONUM) %>%
+  summarise(value = sum(isTop50)) %>%
+  arrange(CONUM)
+top50_by_county <- merge(top50_by_county, county.regions, by.x=c("CONUM"), by.y=c("region"))
+top50_by_county <- merge(county_map, top50_by_county, by.x=c("region", "subregion"), 
+    by.y=c("state.name","county.name"), all.x=TRUE)
+top50_by_county[is.na(top50_by_county)] <- 0
+top50_by_county <- arrange(top50_by_county, group, order)
+ggplot(top50_by_county, aes(x=long, y=lat, group=group, fill=factor(value))) +
+            geom_polygon(colour=NA, aes(fill=factor(value))) +
+            scale_fill_manual(values=c("grey","red","orange","yellow","green")) +
+            expand_limits(x = top50_by_county$long, y = top50_by_county$lat) +
+            coord_map("polyconic") + 
+            labs(fill="Number of Top 50\nSchool Districts\nPer County")
+```
+
+Although the map is a little difficult to read, we can still see that there is still some clustering effect even at the county level. Looking deeper into the county level of the top two states (New York, and Illinois)...
+```{r Bivariate_Plots_7}
+top50_by_county_NY = subset(top50_by_county, state.abb == "NY")
+top50_by_county_IL = subset(top50_by_county, state.abb == "IL")
+ggplot(top50_by_county_NY,
+       aes(x=long, y=lat, group=group, fill=factor(value))) +
+            geom_polygon(colour="black", aes(fill=factor(value))) +
+            scale_fill_manual(values=c("grey","red","green")) +
+            expand_limits(x = top50_by_county_NY$long, y = top50_by_county_NY$lat) +
+            coord_map("polyconic") + 
+            labs(fill="Number of Top 50\nSchool Districts\nPer County")
+
+ggplot(top50_by_county_IL,
+       aes(x=long, y=lat, group=group, fill=factor(value))) +
+            geom_polygon(colour="black", aes(fill=factor(value))) +
+            scale_fill_manual(values=c("grey","orange","yellow")) +
+            expand_limits(x = top50_by_county_IL$long, y = top50_by_county_IL$lat) +
+            coord_map("polyconic") + 
+            labs(fill="Number of Top 50\nSchool Districts\nPer County")
+```
+
+The clustering does not only happen with neighboring counties, but even in the counties themselves, with two neighboring counties in New York having 6 top 50 districts each.
+
+Do these districts put more money per student as compared to other districts?
+```{r Bivariate_Plots_8}
+total_rev_per_student_by_county <- schoolFinanceFull %>%
+  filter(!is.element(SCHLEV, c("NOOP","AGEN"))) %>%
+  group_by(CONUM) %>%
+  summarise(value = sum(TLOCREV) / sum(NUMSTUDENTS)) %>%
+  arrange(CONUM)
+colnames(total_rev_per_student_by_county) <- c("region", "value")
+ny_counties <- county.regions[county.regions$state.abb == "NY",]$region
+il_counties <- county.regions[county.regions$state.abb == "IL",]$region
+county_choropleth(total_rev_per_student_by_county,
+                  county_zoom = ny_counties)
+
+county_choropleth(total_rev_per_student_by_county,
+                  county_zoom = il_counties)
+```
+
+While the top counties are amongst the highest in terms of funding per student, we can see that there are other counties that are in the higher tier that do not have any top schools districts.  This also shows that there is a disparity between counties on how much funding a school district gets per student.
+
+Looking a total revenue compared to number of students:
+```{r Bivariate_Plots_9}
+#total rev per student
+ggplot(aes(x=NUMSTUDENTS, y=TOTALREV), 
+       data=subset(schoolFinanceFull, 
+                   !is.element(SCHLEV, c("NOOP","AGEN")) & TOTALREV < quantile(TOTALREV, 0.99))) + 
+  geom_point(alpha = 1/5, color = "yellow") + 
+  scale_y_continuous(labels = comma) +
+  stat_smooth(method="lm")
+```
+
+The blue line on the plot a linear fit between revenue and number of student. Although the relationship does look linear, this is not a very strong relationship as we see from the above plots that there is quite a bit of variance in funding per student between counties.
+
+# Multivariate Analysis
+We'll breakdown the revenue and number of students relationship some more.
+
+First by the school type:
+
+```{r Multivariate_Plots_1}
+ggplot(aes(x=NUMSTUDENTS, y=TOTALREV), 
+       data = subset(schoolFinanceFull, TOTALREV < quantile(TOTALREV, 0.99) & TOTALREV > 0)) + 
+  geom_point(alpha = 1/5) + 
+  facet_wrap(~SCHLEV) +
+  scale_y_continuous(labels = comma) +
+  geom_smooth(method="lm", se=FALSE)
+```
+
+Vocational school districts have a very high revenue to student ratio, whereas elementary, secondary, and elementary-secondary school districts seems to have very similar revenue to student ratio.  Let's look at these three school types specifically since vocational schools are quite different in nature compared to traditional elementary and secondary schools.
+
+```{r Multivariate_Plots_2}
+ele_sec_school <- subset(schoolFinanceFull, SCHLEV %in% c("ELE","SEC","ELE-SEC"))
+ggplot(aes(x=NUMSTUDENTS, y=TOTALREV, color = SCHLEV), 
+       data = subset(ele_sec_school, 
+                     TOTALREV < quantile(TOTALREV, 0.99) & TOTALREV > 0)) + 
+  geom_point(alpha = 1/10) + 
+  scale_y_continuous(labels = comma) +
+  geom_smooth(method="lm", se=FALSE) +
+  geom_point(data=subset(ele_sec_school, isTop50 == TRUE), 
+             aes(x=NUMSTUDENTS, y=TOTALREV), 
+             shape=4, size = 5, color = "black")
+```
+
+Even though most school districts are a combination of elementary and secondary schools, we can still see that on average, secondary school only districts get higher funding per student while elementary school only districts has less funding.
+We also marked with X's the districts that are in the top 50 ranking and we can see that the revenue to student ratio is consistently higher than average.
+
+Next, we breakdown the revenue to student relationship by government type.
+```{r Multivariate_Plots_3}
+ggplot(aes(x=NUMSTUDENTS, y=TOTALREV), 
+       data = subset(schoolFinanceFull,
+                     !is.element(SCHLEV, c("NOOP","AGEN")) &
+                     TOTALREV < quantile(TOTALREV, 0.99) & TOTALREV > 0)) + 
+  geom_point(alpha = 1/10, color = "red") + 
+  facet_wrap(~GOVTYPE) +
+  scale_y_continuous(labels = comma) +
+  geom_smooth(method="lm", se=FALSE) +
+  geom_point(data=subset(ele_sec_school, isTop50 == TRUE), 
+             aes(x=NUMSTUDENTS, y=TOTALREV), 
+             shape=4, size = 5, color = "black")
+```
+
+Although there are not too many data points, it looks like school districts that are state dependent, city dependent, and township dependent are generally better funded than independent school district.  Also, while most of the top 50 schools are independent school districts, there are a few top 50 school districts that are township dependent. There is not enough data to give any conclusions, but it would be interest to see if township dependent school districts will have more top ranks if there are more ranking data.
+
+We will now look at revenue at a different angle by breaking down total revenue to its federal and state constituents.
+```{r Multivariate_Plots_4}
+fed_state_rev <- ele_sec_school[c("IDCENSUS", "STATE", "NUMSTUDENTS", "TFEDREV", "TSTREV","isTop50")]
+fed_state_rev <- melt(fed_state_rev, id.vars = c("IDCENSUS", "STATE", "NUMSTUDENTS", "isTop50"))
+colnames(fed_state_rev) <- c("IDCENSUS", "STATE", "NUMSTUDENTS", "ISTOP50","REVLEVEL", "REV")
+
+ggplot(aes(x=factor(STATE), y=REV/NUMSTUDENTS, color = factor(REVLEVEL)), 
+       data=subset(fed_state_rev, NUMSTUDENTS > 0 & REV > 0)) + 
+  geom_boxplot(alpha = 1/3, position = "identity") +
+  scale_y_log10(labels = comma) + 
+  theme(axis.text.x = element_text(angle = 90)) +
+  geom_point(data=subset(fed_state_rev, ISTOP50 == TRUE), 
+             aes(x=factor(STATE), y=REV/NUMSTUDENTS), 
+             shape=4, size = 3)
+```
+
+There is a lot to unpack here. First, we see that state funding is consistently higher than federal funding (except for District of Colombia where they do not have any state funding).  We also noticed that federal funding is generally equal across states although there are a few exceptions.  Since D.C does not have state funding, it had higher federal funding.  Vermont, on the other hand have very low federal funding and the funding is mostly left to the state.  Finally, we continued to mark the top 50 school district with X's, and interestingly many of the top 50 school districts are not well funded at the federal level or state level.  Many of the districts fall below the first quartile.  But notice that in our previous plots, the top50 schools are generally well funded.  So where does the districts revenue come from?
+```{r Multivariate_Plots_5}
+ggplot(aes(x=NUMSTUDENTS, y=TLOCREV, color = SCHLEV), 
+       data = subset(ele_sec_school, 
+                     TLOCREV < quantile(TLOCREV, 0.99) & TLOCREV > 0)) + 
+  geom_point(alpha = 1/5) + 
+  scale_y_continuous(labels = comma) +
+  geom_smooth(method="lm", se=FALSE) +
+  geom_point(data=subset(ele_sec_school, isTop50 == TRUE), 
+             aes(x=NUMSTUDENTS, y=TLOCREV), 
+             shape=4, size = 5, color = "black") +
+  coord_cartesian(xlim = c(0, 50000), ylim = c(0,300000))
+```
+
+It turns out that most of the top 50 districts have the most funding per student from local sources compared to other districts. We note that the relationship between revenue and number of students is no longer linear. It is also interesting to note that elementary only school districts have more local revenue per student than elementary-secondary school districts.
+
+------
+
+# Final Plots and Summary
+
+### Plot One
+```{r Plot_One}
+p1 <- ggplot(top50_by_county_NY,
+             aes(x=long, y=lat, group=group, fill=factor(value))) +
+  geom_polygon(colour="black", aes(fill=factor(value))) +
+  scale_fill_manual(values=c("grey","red","green")) +
+  expand_limits(x = top50_by_county_NY$long, y = top50_by_county_NY$lat) +
+  coord_map("polyconic") + 
+  labs(fill="Number of Top 50\nSchool Districts\nPer County") +
+  ggtitle("Top School Districts (NY)")
+
+p2 <- ggplot(top50_by_county_IL,
+             aes(x=long, y=lat, group=group, fill=factor(value))) +
+  geom_polygon(colour="black", aes(fill=factor(value))) +
+  scale_fill_manual(values=c("grey","orange","yellow")) +
+  expand_limits(x = top50_by_county_IL$long, y = top50_by_county_IL$lat) +
+  coord_map("polyconic") +
+  labs(fill="Number of Top 50\nSchool Districts\nPer County") +
+  ggtitle("Top School Districts (IL)")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+### Description One
+There seems to be a clustering effect when states have multiple districts that are in the top 50 ranking, all the way down to the county level.  However, we realize that there is only 50 data points and this finding is not conclusive.  It would be worthwhile to collect more data on school district rankings to see if this clustering effect holds.
+
+### Plot Two
+```{r fig.width=7, Plot_Two}
+ggplot(aes(x=factor(STATE), y=REV/NUMSTUDENTS * 1000, color = factor(REVLEVEL)), 
+       data=subset(fed_state_rev, NUMSTUDENTS > 0 & REV > 0)) + 
+  geom_boxplot(alpha = 1/3, position = "identity") +
+  scale_y_log10(labels = comma) + 
+  theme(axis.text.x = element_text(angle = 90)) +
+  geom_point(data=subset(fed_state_rev, ISTOP50 == TRUE), 
+             aes(x=factor(STATE), y=REV/NUMSTUDENTS * 1000), 
+             shape=4, size = 3) +
+  scale_color_discrete(name = "Source of Revenue", 
+                       labels = c("Federal", "State")) +
+  xlab("State") +
+  ylab("$ Per Student (log scale)") +
+  ggtitle("Revenue per Student by Revenue Source")
+```
+
+### Description Two
+The plot above shows a counterintertuitive relationship between federal and state funding to top ranking schools. The top districts is consistently getting less revenue from federal and state sources, and is worth further investigation as to why this is the case.  Is there actually a correlation between ranking and revenue allocation or are there other factors at play?  We also note that the state of Vermont has much lower federal funding than all the other states, with the median being less than $100 per student.
+
+### Plot Three
+```{r Plot_Three}
+ggplot(aes(x=NUMSTUDENTS, y=TLOCREV/1000, color = SCHLEV), 
+       data = subset(ele_sec_school, 
+                     TLOCREV < quantile(TLOCREV, 0.99) & TLOCREV > 0)) + 
+  geom_point(alpha = 1/5) +
+  geom_smooth(method="lm", se=FALSE) +
+  geom_point(data=subset(ele_sec_school, isTop50 == TRUE), 
+             aes(x=NUMSTUDENTS, y=TLOCREV/1000), 
+             shape=4, size = 5, color = "black") +
+  coord_cartesian(xlim = c(0, 50000), ylim = c(0,300)) +
+  xlab("Number of Students") +
+  ylab("Local Revenue ($mm)") +
+  scale_color_discrete(name = "School Type", 
+                       labels = c("Elementary", "Secondary", "Elementary-\nSecondary")) +
+  ggtitle("Local Revenue per Student by School Type")
+```
+
+### Description Three
+This is the strongest relationship we have found throughout this analysis. Local revenue streams seems to affect ranking of school districts.  Perhaps this is a reflection on the emphasis on education communities have. Local revenue could be a very good feature to use if we were to build a prediction model on top ranked school districts.
+
+------
+
+# Reflection
+Although we found some good relationships between a school district's finances with respect to its rankings we did not build out a model as this data alone does not tell the whole story of how a school will be ranked. Demographics data and being able to normalize revenue and expenditure based on a cost of living index would very likely paint a much more complete picture of and would be worth further exploration.  
+Having this data could also allow us to explore other aspects of a school districts finances such as "where funding is allocated versus the demographics of an area? (Ex. school lunch programs)". Finally, we noted earlier that this analysis only looked at the top 50 districts, whereas the ability to analysis perhaps the top 200 or even 1000 districts could reveal more patterns or trends. 
